@@ -9,6 +9,7 @@ models/Controlnet/*
 models/DreamBooth_LoRA/*
 models/DreamBooth_LoRA/Put*personalized*T2I*checkpoints*here.txt
 models/Motion_Module/*
+.idea
 models/*
 *.ipynb
 *.safetensors
