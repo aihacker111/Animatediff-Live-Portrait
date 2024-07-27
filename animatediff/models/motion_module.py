@@ -1,15 +1,17 @@
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import List, Optional, Tuple, Union
 
 import torch
+import numpy as np
 import torch.nn.functional as F
 from torch import nn
+import torchvision
 
-
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.models.attention import FeedForward
-from diffusers.models.attention_processor import  Attention, XFormersAttnProcessor, AttnProcessor
+from diffusers.models.attention import Attention as CrossAttention, FeedForward
 
 from einops import rearrange, repeat
 import math
@@ -243,7 +245,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class VersatileAttention(Attention):
+class VersatileAttention(CrossAttention):
     def __init__(
             self,
             attention_mode                     = None,
@@ -266,48 +268,18 @@ class VersatileAttention(Attention):
 
     def extra_repr(self):
         return f"(Module Info) Attention_Mode: {self.attention_mode}, Is_Cross_Attention: {self.is_cross_attention}"
-    
-    def set_use_memory_efficient_attention_xformers(
-        self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None
-    ):
-        if use_memory_efficient_attention_xformers:
-            if not is_xformers_available():
-                raise ModuleNotFoundError(
-                    (
-                        "Refer to https://github.com/facebookresearch/xformers for more information on how to install"
-                        " xformers"
-                    ),
-                    name="xformers",
-                )
-            elif not torch.cuda.is_available():
-                raise ValueError(
-                    "torch.cuda.is_available() should be True but is False. xformers' memory efficient attention is"
-                    " only available for GPU "
-                )
-            else:
-                try:
-                    # Make sure we can run the memory efficient attention
-                    _ = xformers.ops.memory_efficient_attention(
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
-                    )
-                except Exception as e:
-                    raise e
 
-            # XFormersAttnProcessor corrupts video generation and work with Pytorch 1.13.
-            # Pytorch 2.0.1 AttnProcessor works the same as XFormersAttnProcessor in Pytorch 1.13.
-            # You don't need XFormersAttnProcessor here.
-            # processor = XFormersAttnProcessor(
-            #     attention_op=attention_op,
-            # )
-            processor = AttnProcessor()
-        else:
-            processor = AttnProcessor()
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None):
+        batch_size, sequence_length, _ = hidden_states.shape
 
-        self.set_processor(processor)
+        if encoder_hidden_states is not None:
+            print("INSIDE ATTENTION:", type(self.processor).__name__, encoder_hidden_states.shape)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, video_length=None, **cross_attention_kwargs):
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
         if self.attention_mode == "Temporal":
             d = hidden_states.shape[1]
             hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
@@ -319,16 +291,54 @@ class VersatileAttention(Attention):
         else:
             raise NotImplementedError
 
-        hidden_states = self.processor(
-            self,
-            hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
-            **cross_attention_kwargs,
-        )
+        encoder_hidden_states = encoder_hidden_states
+
+        if self.group_norm is not None:
+            hidden_states = self.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = self.to_q(hidden_states)
+        dim = query.shape[-1]
+        query = self.reshape_heads_to_batch_dim(query)
+
+        if self.added_kv_proj_dim is not None:
+            raise NotImplementedError
+
+        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        key = self.to_k(encoder_hidden_states)
+        value = self.to_v(encoder_hidden_states)
+
+        key = self.reshape_heads_to_batch_dim(key)
+        value = self.reshape_heads_to_batch_dim(value)
+
+        if attention_mask is not None:
+            if attention_mask.shape[-1] != query.shape[1]:
+                target_length = query.shape[1]
+                attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+                attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
+
+
+
+        hidden_states = self.processor(self, hidden_states = hidden_states, encoder_hidden_states= encoder_hidden_states, attention_mask= attention_mask)
+        # hidden_states = self.batch_to_head_dim(hidden_states)
+        hidden_states = hidden_states.to(query.dtype)
+
 
         if self.attention_mode == "Temporal":
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
 
         return hidden_states
+    
 
+    def reshape_heads_to_batch_dim(self, tensor):
+        batch_size, seq_len, dim = tensor.shape
+        head_size = self.heads
+        tensor = tensor.reshape(batch_size, seq_len, head_size, dim // head_size)
+        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size * head_size, seq_len, dim // head_size)
+        return tensor
+
+    def reshape_batch_dim_to_heads(self, tensor):
+        batch_size, seq_len, dim = tensor.shape
+        head_size = self.heads
+        tensor = tensor.reshape(batch_size // head_size, head_size, seq_len, dim)
+        tensor = tensor.permute(0, 2, 1, 3).reshape(batch_size // head_size, seq_len, dim * head_size)
+        return tensor

@@ -7,8 +7,18 @@ import torch
 import torchvision
 import torch.distributed as dist
 
+from safetensors import safe_open
 from tqdm import tqdm
 from einops import rearrange
+# from animatediff.utils.convert_from_ckpt import convert_ldm_unet_checkpoint, convert_ldm_clip_checkpoint, convert_ldm_vae_checkpoint
+from animatediff.utils.convert_from_ckpt import convert_ldm_unet_checkpoint
+from diffusers.pipelines.stable_diffusion.convert_from_ckpt import convert_ldm_clip_checkpoint, convert_ldm_vae_checkpoint
+from animatediff.utils.convert_lora_safetensor_to_diffusers import convert_lora, convert_motion_lora_ckpt_to_diffusers
+# from diffusers.pipelines.stable_diffusion.convert_lora_safetensor_to_diffusers import convert_lora, convert_motion_lora_ckpt_to_diffusers
+import PIL.Image
+import PIL.ImageOps
+from packaging import version
+from PIL import Image
 
 
 def zero_rank_print(s):
@@ -87,3 +97,155 @@ def ddim_loop(pipeline, ddim_scheduler, latent, num_inv_steps, prompt):
 def ddim_inversion(pipeline, ddim_scheduler, video_latent, num_inv_steps, prompt=""):
     ddim_latents = ddim_loop(pipeline, ddim_scheduler, video_latent, num_inv_steps, prompt)
     return ddim_latents
+
+def load_weights(
+    animation_pipeline,
+    # motion module
+    motion_module_path         = "",
+    motion_module_lora_configs = [],
+    # image layers
+    dreambooth_model_path = "",
+    lora_model_path       = "",
+    lora_alpha            = 0.8,
+):
+    # 1.1 motion module
+    unet_state_dict = {}
+    if motion_module_path != "":
+        print(f"load motion module from {motion_module_path}")
+        motion_module_state_dict = torch.load(motion_module_path, map_location="cpu")
+        motion_module_state_dict = motion_module_state_dict["state_dict"] if "state_dict" in motion_module_state_dict else motion_module_state_dict
+        unet_state_dict.update({name: param for name, param in motion_module_state_dict.items() if "motion_modules." in name})
+    
+    missing, unexpected = animation_pipeline.unet.load_state_dict(unet_state_dict, strict=False)
+    assert len(unexpected) == 0
+    del unet_state_dict
+
+    if dreambooth_model_path != "":
+        print(f"load dreambooth model from {dreambooth_model_path}")
+        if dreambooth_model_path.endswith(".safetensors"):
+            dreambooth_state_dict = {}
+            with safe_open(dreambooth_model_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    dreambooth_state_dict[key] = f.get_tensor(key)
+        elif dreambooth_model_path.endswith(".ckpt"):
+            dreambooth_state_dict = torch.load(dreambooth_model_path, map_location="cpu")
+            
+        # 1. vae
+        converted_vae_checkpoint = convert_ldm_vae_checkpoint(dreambooth_state_dict, animation_pipeline.vae.config)
+        animation_pipeline.vae.load_state_dict(converted_vae_checkpoint)
+        # 2. unet
+        converted_unet_checkpoint = convert_ldm_unet_checkpoint(dreambooth_state_dict, animation_pipeline.unet.config)
+        animation_pipeline.unet.load_state_dict(converted_unet_checkpoint, strict=False)
+        # 3. text_model
+        animation_pipeline.text_encoder = convert_ldm_clip_checkpoint(dreambooth_state_dict)
+        del dreambooth_state_dict
+        
+    if lora_model_path != "":
+        print(f"load lora model from {lora_model_path}")
+
+        # assert lora_model_path.endswith(".safetensors")
+
+
+        # lora_state_dict = {}
+        # with safe_open(lora_model_path, framework="pt", device="cpu") as f:
+        #     for key in f.keys():
+        #         lora_state_dict[key] = f.get_tensor(key)
+
+        for (lora, alpha) in zip(lora_model_path,lora_alpha):
+            animation_pipeline.load_lora_weights(lora) #, weight_name="pytorch_lora_weights.safetensors"
+            animation_pipeline.fuse_lora(lora_scale=alpha)
+
+        
+        
+                
+        # animation_pipeline = convert_lora(animation_pipeline, lora_state_dict, alpha=lora_alpha)
+        # del lora_state_dict
+
+
+    for motion_module_lora_config in motion_module_lora_configs:
+        
+        path, alpha = motion_module_lora_config["path"], motion_module_lora_config["alpha"]
+        print(f"load motion LoRA from {path}")
+
+        motion_lora_state_dict = torch.load(path, map_location="cpu")
+        motion_lora_state_dict = motion_lora_state_dict["state_dict"] if "state_dict" in motion_lora_state_dict else motion_lora_state_dict
+
+        animation_pipeline = convert_motion_lora_ckpt_to_diffusers(animation_pipeline, motion_lora_state_dict, alpha)
+
+    return animation_pipeline
+
+
+
+
+
+
+
+
+
+
+
+
+
+if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
+    PIL_INTERPOLATION = {
+        "linear": PIL.Image.Resampling.BILINEAR,
+        "bilinear": PIL.Image.Resampling.BILINEAR,
+        "bicubic": PIL.Image.Resampling.BICUBIC,
+        "lanczos": PIL.Image.Resampling.LANCZOS,
+        "nearest": PIL.Image.Resampling.NEAREST,
+    }
+else:
+    PIL_INTERPOLATION = {
+        "linear": PIL.Image.LINEAR,
+        "bilinear": PIL.Image.BILINEAR,
+        "bicubic": PIL.Image.BICUBIC,
+        "lanczos": PIL.Image.LANCZOS,
+        "nearest": PIL.Image.NEAREST,
+    }
+
+
+def pt_to_pil(images):
+    """
+    Convert a torch image to a PIL image.
+    """
+    images = (images / 2 + 0.5).clamp(0, 1)
+    images = images.cpu().permute(0, 2, 3, 1).float().numpy()
+    images = numpy_to_pil(images)
+    return images
+
+
+def numpy_to_pil(images):
+    """
+    Convert a numpy image or a batch of images to a PIL image.
+    """
+    if images.ndim == 3:
+        images = images[None, ...]
+    images = (images * 255).round().astype("uint8")
+    if images.shape[-1] == 1:
+        # special case for grayscale (single channel) images
+        pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+    else:
+        pil_images = [Image.fromarray(image) for image in images]
+
+
+
+
+def preprocess_image(image):
+    if isinstance(image, torch.Tensor):
+        return image
+    elif isinstance(image, Image.Image):
+        image = [image]
+
+    if isinstance(image[0], Image.Image):
+        w, h = image[0].size
+        w, h = map(lambda x: x - x % 8, (w, h))  # resize to integer multiple of 8
+
+        image = [np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :] for i in image]
+        image = np.concatenate(image, axis=0)
+        image = np.array(image).astype(np.float32) / 255.0
+        image = image.transpose(0, 3, 1, 2)
+        image = 2.0 * image - 1.0
+        image = torch.from_numpy(image)
+    elif isinstance(image[0], torch.Tensor):
+        image = torch.cat(image, dim=0)
+    return image
