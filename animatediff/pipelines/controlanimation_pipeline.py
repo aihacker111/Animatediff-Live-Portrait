@@ -39,7 +39,6 @@ from diffusers.utils import (
 from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
-from ..utils.util import preprocess_image
 
 
 from diffusers.utils.torch_utils import randn_tensor

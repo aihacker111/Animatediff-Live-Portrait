@@ -6,7 +6,7 @@
 input_video_path: "tmp/walk2_cropped.mp4" # Path to the input video file
 output_video_dir: "tmp/output"  # Directory to save the outputs
 
-save_frames: 1 # 0: No, 1: Yes
+save_frames: 0 # 0: No, 1: Yes
 
 # Width and Height of the Input and Output videos
 # If zero the input's video dimension will be used otherwise the input will be resized
@@ -24,7 +24,7 @@ end_time: "00:00:05" # Time in HH:MM:SS format to stop reading the input video
 overlap_strength: 0.92
 
 
-use_lcm: 0 # 0: No, 1: Yes - Use original LCM model. If used, the settings related to LoRA and DreamBooth will be ignored as LCM models do not support them.
+use_lcm: 1 # 0: No, 1: Yes - Use original LCM model. If used, the settings related to LoRA and DreamBooth will be ignored as LCM models do not support them.
 # It is also worth noting that LCM does not have support for negative prompt at the moment.
 
 use_img2img: 0 # 0: No, 1: Yes - Use img2img for non-overlapping frames. If no, then last output frame will be used as base for the added noise of non-overlapping frames.
@@ -97,7 +97,7 @@ frame_count: 16 # How many co-related frames are produced by AnimateDiff - defau
 overlap_length: 8 # Number of frames from previous output frames to be present in the current frames (helps with consistency)
 
 seed: 16086 # -1  #16086  # -1
-steps: 7
+steps: 8
 guidance_scale: 1.1
 strength: 1.0 # Strengtht of the noise to be added to input latents - if 1.0 the img2img effect is nil
 
