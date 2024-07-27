@@ -119,7 +119,7 @@ class ControlAnimatePipeline():
             if not self.use_lcm: self.multicontrolnetresiduals_pipeline.controlnet.half()
             if not self.use_ipadapter: self.multicontrolnetresiduals_pipeline.controlnet.enable_xformers_memory_efficient_attention()
 
-        self.pipeline.load_textual_inversion("models/TI/easynegative.safetensors", token="easynegative")
+        # self.pipeline.load_textual_inversion("models/TI/easynegative.safetensors", token="easynegative")
 
         self.prompt = self.pipeline.maybe_convert_prompt(config.prompt, self.pipeline.tokenizer)
         self.n_prompt = self.pipeline.maybe_convert_prompt(config.n_prompt, self.pipeline.tokenizer)
